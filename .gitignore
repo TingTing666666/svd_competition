@@ -1,0 +1,35 @@
+# Python相关
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# IDE相关
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 数据文件
+CompetitionData1/
+DebugData/
+*.npy
+*.npz
+
+# 模型文件
+*.pth
+*.pt
+
+# 输出文件
+Round*TestOutput*.npz
+results/
+outputs/
+
+# 测试缓存
+.pytest_cache/
+
+# 系统文件
+.DS_Store
+Thumbs.db

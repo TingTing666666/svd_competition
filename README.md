@@ -3,6 +3,8 @@
 ## 📁 项目目录结构
 
 注：请确认克隆后svd_competition目录
+
+DebugData/ CompetitionData1/ 两个文件夹自己添加
 ```
 svd_competition/
 ├── DebugData/

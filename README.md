@@ -37,7 +37,7 @@ svd_competition/
 ```bash
 # 在自选目录下运行以下代码
 # 请选择全英文路径文件夹克隆仓库，符号尽量只含有下划线，如“D:\PyWorks\”
-git clone https://github.com/YOUR_USERNAME/svd_competition.git
+git clone https://github.com/TingTing666666/svd_competition.git
 # 进入文件目录
 cd svd_competition
 ```

@@ -137,7 +137,7 @@ def advanced_train(scene_idx=1, round_idx=1):
     optimizer = optim.AdamW(model.parameters(), lr=2e-3, weight_decay=1e-4)
 
     # 训练参数
-    num_epochs = 80
+    num_epochs = 1
     batch_size = 4  # 减小批次大小以适应大模型
     warmup_epochs = 5
 

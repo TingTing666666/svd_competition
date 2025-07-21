@@ -4,55 +4,80 @@ import torch.nn.functional as F
 import numpy as np
 
 
-class OrthogonalLayer(nn.Module):
-    """符合规则的正交化层 - 使用迭代正交化（修复数据类型问题）"""
+# ---------------------------------------------------------------------------- #
+# 1. 辅助模块：DropPath 和 OrthogonalLayer
+# ---------------------------------------------------------------------------- #
 
-    def __init__(self):
-        super().__init__()
-        self.num_iterations = 5  # 迭代次数
+def drop_path(x, drop_prob: float = 0., training: bool = False, scale_by_keep: bool = True):
+    """按样本随机丢弃主路径（Stochastic Depth）。"""
+    if drop_prob == 0. or not training:
+        return x
+    keep_prob = 1 - drop_prob
+    shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+    random_tensor = x.new_empty(shape).bernoulli_(keep_prob)
+    if keep_prob > 0.0 and scale_by_keep:
+        random_tensor.div_(keep_prob)
+    return x * random_tensor
+
+
+class DropPath(nn.Module):
+    """Drop paths (Stochastic Depth) per sample."""
+
+    def __init__(self, drop_prob=None):
+        super(DropPath, self).__init__()
+        self.drop_prob = drop_prob
 
     def forward(self, x):
-        # x: [M, R, 2] 或 [B, M, R, 2]
+        return drop_path(x, self.drop_prob, self.training)
+
+
+class OrthogonalLayer(nn.Module):
+    """
+    符合竞赛规则的正交化层。
+    使用基于特征值分解的迭代方法，将输入矩阵正交化。
+    这避免了直接使用被禁用的SVD或QR分解。
+    """
+
+    def __init__(self, num_iterations=10):
+        super().__init__()
+        self.num_iterations = num_iterations
+
+    def forward(self, x):
+        # 输入 x 的形状: [M, R, 2] 或 [B, M, R, 2]
         if x.dim() == 3:
             x = x.unsqueeze(0)
             squeeze_output = True
         else:
             squeeze_output = False
 
-        batch_size, M, R, _ = x.shape
+        # 转换为复数张量
+        x_complex = torch.complex(x[..., 0], x[..., 1])
 
-        # 转换为复数
-        x_complex = x[..., 0] + 1j * x[..., 1]
+        # 迭代正交化 (类似Löwdin正交化)
+        # 这个过程是可微分的
+        Q = x_complex
+        for _ in range(self.num_iterations):
+            # 计算 Gram 矩阵 Q^H * Q
+            gram = Q.conj().transpose(-2, -1) @ Q
 
-        # 使用迭代方法进行正交化
-        Q_list = []
-        for b in range(batch_size):
-            Q = x_complex[b]
+            # 使用特征值分解计算 Gram 矩阵的逆平方根
+            # eigh 适用于厄米矩阵，且数值稳定
+            eigenvalues, eigenvectors = torch.linalg.eigh(gram)
 
-            # 迭代正交化过程（类似于Löwdin正交化）
-            for _ in range(self.num_iterations):
-                # 计算当前的Gram矩阵
-                gram = Q.conj().T @ Q
+            # 钳制特征值以避免数值问题
+            eigenvalues = torch.clamp(eigenvalues.real, min=1e-8)
 
-                # 计算Gram矩阵的逆平方根（使用特征分解）
-                # 这避免了直接使用SVD
-                eigenvalues, eigenvectors = torch.linalg.eigh(gram)
-                eigenvalues = torch.clamp(eigenvalues.real, min=1e-8)
+            # 计算逆平方根对角阵
+            inv_sqrt_diag = torch.diag_embed(1.0 / torch.sqrt(eigenvalues)).to(eigenvectors.dtype)
 
-                # ✅ 修复：确保数据类型一致
-                # 构造逆平方根（保持复数类型）
-                inv_sqrt_diag = torch.diag(1.0 / torch.sqrt(eigenvalues)).to(eigenvectors.dtype)
-                gram_inv_sqrt = eigenvectors @ inv_sqrt_diag @ eigenvectors.conj().T
+            # 计算 Gram 矩阵的逆平方根
+            gram_inv_sqrt = eigenvectors @ inv_sqrt_diag @ eigenvectors.conj().transpose(-2, -1)
 
-                # 更新Q
-                Q = Q @ gram_inv_sqrt
-
-            Q_list.append(Q)
-
-        output = torch.stack(Q_list, dim=0)
+            # 更新 Q
+            Q = Q @ gram_inv_sqrt
 
         # 转换回实虚部格式
-        result = torch.stack([output.real, output.imag], dim=-1)
+        result = torch.stack([Q.real, Q.imag], dim=-1)
 
         if squeeze_output:
             result = result.squeeze(0)
@@ -60,95 +85,51 @@ class OrthogonalLayer(nn.Module):
         return result
 
 
-class ImprovedOrthogonalLayer(nn.Module):
-    """备选方案：使用可学习的正交参数化"""
-
-    def __init__(self, M, R):
-        super().__init__()
-        # 使用Cayley变换参数化
-        self.W = nn.Parameter(torch.randn(M, R, 2) * 0.01)
-
-    def forward(self, x):
-        # x: [M, R, 2]
-        if x.dim() == 3:
-            x = x.unsqueeze(0)
-            squeeze_output = True
-        else:
-            squeeze_output = False
-
-        batch_size = x.shape[0]
-
-        # 构建反对称矩阵
-        W_complex = self.W[..., 0] + 1j * self.W[..., 1]
-        A = W_complex - W_complex.conj().T
-
-        # Cayley变换: Q = (I - A)(I + A)^{-1}
-        I = torch.eye(A.shape[0], dtype=A.dtype, device=A.device)
-        Q = torch.linalg.solve(I + A, I - A)
-
-        # 应用到输入
-        x_complex = x[..., 0] + 1j * x[..., 1]
-        output_list = []
-
-        for b in range(batch_size):
-            # 将输入投影到正交空间
-            out = Q @ x_complex[b]
-            output_list.append(out)
-
-        output = torch.stack(output_list, dim=0)
-        result = torch.stack([output.real, output.imag], dim=-1)
-
-        if squeeze_output:
-            result = result.squeeze(0)
-
-        return result
-
+# ---------------------------------------------------------------------------- #
+# 2. 核心网络模块
+# ---------------------------------------------------------------------------- #
 
 class ChannelAwareBlock(nn.Module):
-    """信道感知的特征提取块"""
+    """
+    信道感知特征提取块 (集成了 CNN, Attention, Residual, DropPath)。
+    """
 
-    def __init__(self, in_channels, out_channels, kernel_size=3):
+    def __init__(self, in_channels, out_channels, kernel_size=3, drop_path_prob=0.):
         super().__init__()
-
-        # 卷积块
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size, padding=kernel_size // 2)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size, padding=kernel_size // 2)
         self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size, padding=kernel_size // 2)
         self.bn2 = nn.BatchNorm2d(out_channels)
 
-        # 注意力机制
+        # SE-like Attention
         self.global_pool = nn.AdaptiveAvgPool2d(1)
         self.fc1 = nn.Linear(out_channels, out_channels // 4)
         self.fc2 = nn.Linear(out_channels // 4, out_channels)
 
-        # 残差连接
+        self.drop_path = DropPath(drop_path_prob) if drop_path_prob > 0. else nn.Identity()
         self.residual = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
 
     def forward(self, x):
-        # 残差
-        residual = self.residual(x)
+        shortcut = self.residual(x)
+        x = F.gelu(self.bn1(self.conv1(x)))
+        x = self.bn2(self.conv2(x))
 
-        # 主分支
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-
-        # 注意力分支
-        b, c, h, w = out.shape
-        att = self.global_pool(out).view(b, c)
+        # Attention branch
+        b, c, _, _ = x.shape
+        att = self.global_pool(x).view(b, c)
         att = F.relu(self.fc1(att))
         att = torch.sigmoid(self.fc2(att)).view(b, c, 1, 1)
+        x = x * att
 
-        # 应用注意力
-        out = out * att
-
-        # 残差连接
-        out = F.relu(out + residual)
-
-        return out
+        x = self.drop_path(x)
+        x = F.gelu(x + shortcut)
+        return x
 
 
 class SVDNet(nn.Module):
-    """改进的SVD神经网络"""
+    """
+    最终版 SVD 神经网络。
+    """
 
     def __init__(self, M=64, N=64, R=32):
         super().__init__()
@@ -156,178 +137,148 @@ class SVDNet(nn.Module):
         self.N = N
         self.R = R
 
-        # 特征提取网络
+        # 特征提取网络 (CNN部分)
+        # 线性增加DropPath概率，网络越深，丢弃概率越大
+        dpr = [x.item() for x in torch.linspace(0, 0.2, 4)]
         self.feature_layers = nn.ModuleList([
-            ChannelAwareBlock(2, 32, 3),
-            ChannelAwareBlock(32, 64, 3),
-            ChannelAwareBlock(64, 128, 3),
-            ChannelAwareBlock(128, 256, 3),
+            ChannelAwareBlock(2, 32, 3, drop_path_prob=dpr[0]),  # 64x64
+            nn.MaxPool2d(2),  # 32x32
+            ChannelAwareBlock(32, 64, 3, drop_path_prob=dpr[1]),
+            nn.MaxPool2d(2),  # 16x16
+            ChannelAwareBlock(64, 128, 3, drop_path_prob=dpr[2]),
+            nn.MaxPool2d(2),  # 8x8
+            ChannelAwareBlock(128, 256, 3, drop_path_prob=dpr[3]),
         ])
 
         # 全局特征维度
         feature_dim = 256
 
-        # 多头注意力
-        self.multihead_attn = nn.MultiheadAttention(feature_dim, num_heads=8, batch_first=True)
+        # 多头注意力，用于融合全局特征
+        self.multihead_attn = nn.MultiheadAttention(feature_dim, num_heads=8, batch_first=True, dropout=0.1)
 
-        # 奇异值预测网络（改进：更深的网络）
+        # 奇异值预测头
         self.singular_value_net = nn.Sequential(
-            nn.Linear(feature_dim, 512),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Linear(128, R),
-            nn.Softplus()  # 确保奇异值为正
+            nn.Linear(feature_dim, 512), nn.GELU(), nn.Dropout(0.1),
+            nn.Linear(512, 128), nn.GELU(),
+            nn.Linear(128, R), nn.Softplus()  # 保证奇异值为正
         )
 
-        # 左奇异向量预测网络
+        # 左右奇异向量预测头
+        # 输入融合了特征和预测出的奇异值
         self.left_vector_net = nn.Sequential(
-            nn.Linear(feature_dim + R, 1024),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(1024, 512),
-            nn.ReLU(),
-            nn.Linear(512, M * R * 2)
+            nn.Linear(feature_dim + R, 1024), nn.GELU(), nn.Dropout(0.1),
+            nn.Linear(1024, M * R * 2)
         )
-
-        # 右奇异向量预测网络
         self.right_vector_net = nn.Sequential(
-            nn.Linear(feature_dim + R, 1024),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(1024, 512),
-            nn.ReLU(),
-            nn.Linear(512, N * R * 2)
+            nn.Linear(feature_dim + R, 1024), nn.GELU(), nn.Dropout(0.1),
+            nn.Linear(1024, N * R * 2)
         )
 
-        # 正交化层（使用QR分解版本）
+        # 正交化层
         self.orthogonal_layer = OrthogonalLayer()
 
-        # 权重初始化
+        # 为自动损失加权机制定义的可学习参数
+        self.log_var_recon = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+        self.log_var_ortho = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+
+        # 初始化权重
         self._initialize_weights()
 
     def _initialize_weights(self):
-        """改进的权重初始化"""
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                # Xavier初始化
                 nn.init.xavier_uniform_(m.weight, gain=nn.init.calculate_gain('relu'))
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.Conv2d):
-                # He初始化
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm2d):
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
 
-    def extract_features(self, x):
-        """提取特征"""
-        # x: [M, N, 2] -> [1, 2, M, N]
-        x = x.permute(2, 0, 1).unsqueeze(0)
-
-        # 通过特征提取层
+    def forward(self, x):
+        # x 形状: [M, N, 2]
+        # 1. 特征提取
+        x = x.permute(2, 0, 1).unsqueeze(0)  # -> [1, 2, M, N]
         for layer in self.feature_layers:
             x = layer(x)
 
-        # 全局平均池化
-        features = F.adaptive_avg_pool2d(x, 1).squeeze()  # [feature_dim]
-
-        return features
-
-    def forward(self, x):
-        """前向传播"""
-        # 提取特征
-        features = self.extract_features(x)  # [feature_dim]
-
-        # 使用注意力机制增强特征
-        features_seq = features.unsqueeze(0).unsqueeze(0)  # [1, 1, feature_dim]
+        # 2. 全局特征融合
+        # AdaptiveAvgPool + MultiheadAttention
+        features = F.adaptive_avg_pool2d(x, (1, 1)).squeeze()  # -> [feature_dim]
+        features_seq = features.unsqueeze(0).unsqueeze(0)  # -> [1, 1, feature_dim]
         enhanced_features, _ = self.multihead_attn(features_seq, features_seq, features_seq)
-        enhanced_features = enhanced_features.squeeze()  # [feature_dim]
+        enhanced_features = enhanced_features.squeeze()  # -> [feature_dim]
 
-        # 预测奇异值
-        singular_values = self.singular_value_net(enhanced_features)  # [R]
+        # 3. 预测奇异值
+        singular_values = self.singular_value_net(enhanced_features)
 
-        # 确保奇异值降序排列
+        # 4. 后处理：确保奇异值降序排列并限制范围
         singular_values, _ = torch.sort(singular_values, descending=True)
+        singular_values = torch.clamp(singular_values, min=1e-7)
 
-        # 奇异值正则化（避免过大或过小）
-        singular_values = torch.clamp(singular_values, min=1e-6, max=1e3)
+        # 5. 预测奇异向量
+        features_with_s = torch.cat([enhanced_features, singular_values], dim=-1)
+        U_flat = self.left_vector_net(features_with_s)
+        V_flat = self.right_vector_net(features_with_s)
+        U = U_flat.view(self.M, self.R, 2)
+        V = V_flat.view(self.N, self.R, 2)
 
-        # 将奇异值信息融入特征
-        enhanced_features_with_s = torch.cat([enhanced_features, singular_values], dim=0)
+        # 6. 正交化
+        U_ortho = self.orthogonal_layer(U)
+        V_ortho = self.orthogonal_layer(V)
 
-        # 预测左奇异向量
-        U_flat = self.left_vector_net(enhanced_features_with_s)  # [M*R*2]
-        U = U_flat.view(self.M, self.R, 2)  # [M, R, 2]
-
-        # 预测右奇异向量
-        V_flat = self.right_vector_net(enhanced_features_with_s)  # [N*R*2]
-        V = V_flat.view(self.N, self.R, 2)  # [N, R, 2]
-
-        # 正交化处理
-        U = self.orthogonal_layer(U)  # [M, R, 2]
-        V = self.orthogonal_layer(V)  # [N, R, 2]
-
-        return U, singular_values, V
+        return U_ortho, singular_values, V_ortho
 
 
-def compute_loss(U, S, V, H_ideal, lambda_ortho=0.5, lambda_recon=1.0):
-    """改进的损失函数"""
-    M, R, _ = U.shape
-    N, R, _ = V.shape
+# ---------------------------------------------------------------------------- #
+# 3. 损失函数与评估指标
+# ---------------------------------------------------------------------------- #
 
-    # 转换为复数
-    U_complex = U[..., 0] + 1j * U[..., 1]  # [M, R]
-    V_complex = V[..., 0] + 1j * V[..., 1]  # [N, R]
-    H_ideal_complex = H_ideal[..., 0] + 1j * H_ideal[..., 1]  # [M, N]
+def compute_loss(model, U_out, S_out, V_out, H_ideal):
+    """
+    计算总损失，集成了自动加权机制。
+    """
+    # 将输出和标签转换为复数
+    U_complex = torch.complex(U_out[..., 0], U_out[..., 1])
+    V_complex = torch.complex(V_out[..., 0], V_out[..., 1])
+    H_ideal_complex = torch.complex(H_ideal[..., 0], H_ideal[..., 1])
 
-    # 重构矩阵
-    S_diag = torch.diag(S.to(torch.complex64))  # [R, R]
-    H_recon = U_complex @ S_diag @ V_complex.conj().T  # [M, N]
-
-    # 1. 重构损失（使用相对误差）
+    # --- 任务1: 重构损失 ---
+    S_diag = torch.diag(S_out).to(torch.complex64)
+    H_recon = U_complex @ S_diag @ V_complex.conj().T
     recon_error = torch.norm(H_ideal_complex - H_recon, p='fro')
     ideal_norm = torch.norm(H_ideal_complex, p='fro')
     recon_loss = recon_error / (ideal_norm + 1e-8)
 
-    # 2. 正交性约束（软约束）
-    I = torch.eye(R, device=U.device, dtype=torch.complex64)
+    # --- 任务2: 正交性损失 ---
+    R = U_out.shape[1]
+    I = torch.eye(R, device=U_out.device, dtype=torch.complex64)
     U_ortho_loss = torch.norm(U_complex.conj().T @ U_complex - I, p='fro') / R
     V_ortho_loss = torch.norm(V_complex.conj().T @ V_complex - I, p='fro') / R
+    ortho_loss = U_ortho_loss + V_ortho_loss
 
-    # 3. 奇异值单调性约束
-    if R > 1:
-        monotonic_loss = torch.sum(F.relu(S[1:] - S[:-1] + 1e-6))
-    else:
-        monotonic_loss = torch.tensor(0.0, device=S.device)
+    # --- 自动加权 ---
+    # 根据 "Multi-Task Learning Using Uncertainty to Weigh Losses..."
+    # L(W, sigma) = L_i(W) / (2*sigma_i^2) + log(sigma_i)
+    # 这里我们简化为 L = exp(-log_var)*L_task + log_var
+    loss1 = torch.exp(-model.log_var_recon) * recon_loss + model.log_var_recon
+    loss2 = torch.exp(-model.log_var_ortho) * ortho_loss + model.log_var_ortho
 
-    # 4. 奇异值范围约束
-    sv_penalty = torch.mean(F.relu(S - 100)) + torch.mean(F.relu(1e-6 - S))
+    total_loss = loss1 + loss2
 
-    # 总损失
-    total_loss = (lambda_recon * recon_loss +
-                  lambda_ortho * (U_ortho_loss + V_ortho_loss) +
-                  0.01 * monotonic_loss +
-                  0.001 * sv_penalty)
-
-    return total_loss, recon_loss, U_ortho_loss, V_ortho_loss
+    return total_loss, recon_loss, ortho_loss
 
 
 def compute_ae_metric(U, S, V, H_ideal):
-    """计算AE指标"""
+    """计算官方的 AE 指标，用于验证。"""
     # 转换为复数
-    U_complex = U[..., 0] + 1j * U[..., 1]
-    V_complex = V[..., 0] + 1j * V[..., 1]
-    H_ideal_complex = H_ideal[..., 0] + 1j * H_ideal[..., 1]
+    U_complex = torch.complex(U[..., 0], U[..., 1])
+    V_complex = torch.complex(V[..., 0], V[..., 1])
+    H_ideal_complex = torch.complex(H_ideal[..., 0], H_ideal[..., 1])
 
     # 重构矩阵
-    S_diag = torch.diag(S.to(torch.complex64))
+    S_diag = torch.diag(S).to(torch.complex64)
     H_recon = U_complex @ S_diag @ V_complex.conj().T
 
     # 重构误差
@@ -339,5 +290,4 @@ def compute_ae_metric(U, S, V, H_ideal):
     V_ortho_error = torch.norm(V_complex.conj().T @ V_complex - I, p='fro')
 
     ae = recon_error + U_ortho_error + V_ortho_error
-
     return ae.item()

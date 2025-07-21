@@ -96,9 +96,10 @@ def simple_train(scene_idx=1, round_idx=1):
                 # 前向传播
                 U_out, S_out, V_out = model(H_data)
 
-                # 计算损失
-                loss, recon_loss, U_ortho_loss, V_ortho_loss = compute_loss(
-                    U_out, S_out, V_out, H_label, lambda_ortho=0.1
+                # 计算损失 (新的调用方式)
+                # 将 model 对象传递给 compute_loss 函数
+                loss, recon_loss, ortho_loss = compute_loss(
+                    model, U_out, S_out, V_out, H_label
                 )
 
                 batch_loss += loss

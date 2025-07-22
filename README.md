@@ -1,31 +1,51 @@
-# SVD竞赛main_stable_v3_14h启动指南
+# SVD竞赛main_stable_multi_test启动指南
 
-## 快速开始
+## 4个版本可以同时训练：
 
-### 1. 训练模型
+### 方法1: 单独训练特定版本
 ```bash
-# 训练单个场景
+# 训练v1版本(强正交化)
+python multi_train.py --version v1 --scene 1 --round 1
+
+# 训练v2版本(注意力增强)
+python multi_train.py --version v2 --scene 1 --round 1
+
+# 训练v3版本(轻量高效)
+python multi_train.py --version v3 --scene 1 --round 1
+
+# 原始版本
 python simple_train.py --scene 1 --round 1
-
-# 训练所有场景
-python simple_train.py --round 1
 ```
 
-### 2. 测试并生成提交文件
+### 方法2: 自动对比所有版本
 ```bash
-# 测试所有场景并创建提交包
-python test_and_submit.py --round 1 --submit
+# 对单个场景训练所有版本并自动选择最佳
+python multi_train.py --scene 1 --round 1
+
+# 对所有场景训练所有版本
+python multi_train.py --all --round 1
 ```
 
-## 文件说明
+### 方法3: 并行启动(多终端)
+```bash
+# 终端1
+python multi_train.py --version v1 --scene 1 --round 1 &
 
-- **solution.py**: 核心SVD神经网络模型
-- **simple_train.py**: 训练脚本
-- **test_and_submit.py**: 测试和提交文件生成
+# 终端2  
+python multi_train.py --version v2 --scene 1 --round 1 &
 
-## 训练流程
+# 终端3
+python multi_train.py --version v3 --scene 1 --round 1 &
 
-1. 将比赛数据放在 `./CompetitionData1/` 目录下
-2. 运行训练命令，会自动生成 `svd_model_round1_scene*.pth` 模型文件
-3. 运行测试命令，会生成 `Round1TestOutput*.npz` 结果文件
-4. 最终生成 `submission_round1.zip` 提交包
+# 终端4
+python simple_train.py --scene 1 --round 1 &
+```
+
+### 各版本特点
+
+- **v1 (强正交化)**: 多次迭代正交化，严格约束，可能AE最低但训练慢
+- **v2 (注意力增强)**: 注意力机制+残差连接，表达能力强
+- **v3 (轻量高效)**: 参数少训练快，适合快速验证
+- **原版**: 中等复杂度的baseline
+
+系统会自动选择最佳版本并复制为标准命名，然后用test_and_submit.py测试即可。

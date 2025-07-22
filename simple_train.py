@@ -68,13 +68,13 @@ def simple_train(scene_idx=1, round_idx=1):
     train_label = np.load(train_label_path).astype(np.float32)
     print(f"Data shapes: data={train_data.shape}, label={train_label.shape}")
 
-    # 数据采样 - 使用更多数据
-    sample_size = min(10000, samp_num)
+    # 数据采样 - 更少数据
+    sample_size = min(5000, samp_num)  # 减少到5000
     indices = np.random.choice(samp_num, sample_size, replace=False)
     train_data = train_data[indices]
     train_label = train_label[indices]
 
-    # 划分训练集和验证集
+    # 划分数据
     val_size = int(sample_size * 0.15)
     val_indices = np.random.choice(sample_size, val_size, replace=False)
     train_indices = np.setdiff1d(np.arange(sample_size), val_indices)
@@ -91,19 +91,19 @@ def simple_train(scene_idx=1, round_idx=1):
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {total_params:,}")
 
-    # 优化器和调度器
-    optimizer = optim.AdamW(model.parameters(), lr=2e-3, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=40, eta_min=1e-6)
+    # 优化器设置
+    optimizer = optim.AdamW(model.parameters(), lr=1.5e-3, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=20, eta_min=1e-6)
 
-    # 训练参数
-    num_epochs = 40
-    batch_size = 32  # 增大batch_size提升效率
+    # 训练参数 - 极简配置
+    num_epochs = 20  # 减少epoch
+    batch_size = 64  # 增大batch size
 
     print(f"Training: {num_epochs} epochs, batch_size={batch_size}")
 
     # 训练循环
     best_val_ae = float('inf')
-    patience = 10
+    patience = 5  # 更短的耐心
     patience_counter = 0
 
     for epoch in range(num_epochs):
@@ -113,7 +113,6 @@ def simple_train(scene_idx=1, round_idx=1):
         epoch_ae = 0.0
         num_batches = 0
 
-        # 随机打乱数据
         train_indices_epoch = np.random.permutation(len(train_data))
 
         pbar = tqdm(range(0, len(train_data), batch_size),
@@ -128,31 +127,23 @@ def simple_train(scene_idx=1, round_idx=1):
             batch_loss = 0.0
             batch_ae = 0.0
 
-            # 处理批次中的每个样本
             for idx in batch_indices:
                 H_data = torch.FloatTensor(train_data[idx]).to(device)
                 H_label = torch.FloatTensor(train_label[idx]).to(device)
 
-                # 前向传播
                 U_out, S_out, V_out = model(H_data)
 
-                # 计算损失
-                loss, recon_loss, U_ortho_loss, V_ortho_loss = compute_loss(
-                    U_out, S_out, V_out, H_label, lambda_ortho=0.4
-                )
+                loss, _, _, _ = compute_loss(U_out, S_out, V_out, H_label, lambda_ortho=0.4)
 
-                # 梯度累积
                 loss = loss / len(batch_indices)
                 loss.backward()
 
                 batch_loss += loss.item() * len(batch_indices)
 
-                # 计算AE
                 with torch.no_grad():
                     ae = compute_ae_metric(U_out, S_out, V_out, H_label)
                     batch_ae += ae
 
-            # 梯度更新
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
@@ -191,7 +182,6 @@ def simple_train(scene_idx=1, round_idx=1):
         else:
             patience_counter += 1
 
-        # 早停
         if patience_counter >= patience:
             print(f"Early stopping at epoch {epoch + 1}")
             break
@@ -204,9 +194,8 @@ def train_all_scenes(round_idx=1):
     scenes = [1, 2, 3]
 
     for scene_idx in scenes:
-        print(f"\n{'=' * 50}")
-        print(f"Training Scene {scene_idx}")
-        print(f"{'=' * 50}")
+        print(f"\nTraining Scene {scene_idx}")
+        print("=" * 50)
 
         try:
             model = simple_train(scene_idx, round_idx)

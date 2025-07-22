@@ -5,8 +5,6 @@ import numpy as np
 
 
 class GramSchmidtLayer(nn.Module):
-    """Gram-Schmidt正交化 - 不使用任何禁止算子"""
-
     def __init__(self):
         super().__init__()
 
@@ -15,23 +13,19 @@ class GramSchmidtLayer(nn.Module):
         M, R, _ = x.shape
         x_complex = x[..., 0] + 1j * x[..., 1]
 
-        # Gram-Schmidt正交化
         Q = torch.zeros_like(x_complex)
 
         for j in range(R):
             v = x_complex[:, j]
 
-            # 正交化
             for i in range(j):
                 proj_coeff = torch.sum(torch.conj(Q[:, i]) * v)
                 v = v - proj_coeff * Q[:, i]
 
-            # 归一化
             norm = torch.sqrt(torch.sum(torch.abs(v) ** 2) + 1e-8)
-            Q = Q.clone()  # 避免原地操作
+            Q = Q.clone()
             Q[:, j] = v / norm
 
-        # 转换回实虚部
         return torch.stack([Q.real, Q.imag], dim=-1)
 
 
@@ -42,74 +36,44 @@ class SVDNet(nn.Module):
         self.N = N
         self.R = R
 
-        # 卷积特征提取 - 提取空间特征
+        # 极简网络结构
         self.conv_net = nn.Sequential(
-            nn.Conv2d(2, 32, 3, padding=1),
+            nn.Conv2d(2, 32, 5, stride=2, padding=2),  # 直接下采样
             nn.ReLU(),
-            nn.Conv2d(32, 64, 3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(64, 128, 3, padding=1),
+            nn.Conv2d(32, 64, 5, stride=2, padding=2),  # 继续下采样
             nn.ReLU(),
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten()
         )
 
-        # 全连接层
-        self.fc_net = nn.Sequential(
-            nn.Linear(128, 256),
+        # 简化的特征处理
+        self.feature_net = nn.Sequential(
+            nn.Linear(64, 256),
             nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(256, 512),
-            nn.ReLU()
+            nn.Linear(256, 256)
         )
 
-        # 奇异值预测
-        self.s_net = nn.Sequential(
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Linear(256, R),
-            nn.Softplus()
-        )
+        # 直接预测
+        self.s_net = nn.Linear(256, R)
+        self.u_net = nn.Linear(256, M * R * 2)
+        self.v_net = nn.Linear(256, N * R * 2)
 
-        # U矩阵预测
-        self.u_net = nn.Sequential(
-            nn.Linear(512, 512),
-            nn.ReLU(),
-            nn.Linear(512, M * R * 2)
-        )
-
-        # V矩阵预测
-        self.v_net = nn.Sequential(
-            nn.Linear(512, 512),
-            nn.ReLU(),
-            nn.Linear(512, N * R * 2)
-        )
-
-        # 正交化层
         self.orthogonal = GramSchmidtLayer()
 
     def forward(self, x):
         # x: [M, N, 2]
-        # 转换为卷积输入格式
         x_conv = x.permute(2, 0, 1).unsqueeze(0)  # [1, 2, M, N]
 
-        # 卷积特征提取
-        conv_features = self.conv_net(x_conv).squeeze(0)  # [128]
+        # 快速特征提取
+        conv_features = self.conv_net(x_conv).squeeze(0)  # [64]
+        features = self.feature_net(conv_features)  # [256]
 
-        # 全连接特征
-        features = self.fc_net(conv_features)  # [512]
-
-        # 预测奇异值并排序
-        s_values = self.s_net(features)  # [R]
+        # 直接预测
+        s_values = F.softplus(self.s_net(features))  # [R]
         s_values = torch.sort(s_values, descending=True)[0]
 
-        # 预测U和V矩阵
-        u_flat = self.u_net(features)
-        v_flat = self.v_net(features)
-
-        u_matrix = u_flat.view(self.M, self.R, 2)
-        v_matrix = v_flat.view(self.N, self.R, 2)
+        u_matrix = self.u_net(features).view(self.M, self.R, 2)
+        v_matrix = self.v_net(features).view(self.N, self.R, 2)
 
         # 正交化
         u_matrix = self.orthogonal(u_matrix)
@@ -119,17 +83,16 @@ class SVDNet(nn.Module):
 
 
 def compute_loss(U, S, V, H_ideal, lambda_ortho=0.5):
-    """计算损失函数"""
     # 转换为复数
-    U_complex = U[..., 0] + 1j * U[..., 1]
-    V_complex = V[..., 0] + 1j * V[..., 1]
-    H_ideal_complex = H_ideal[..., 0] + 1j * H_ideal[..., 1]
+    U_complex = U[..., 0] + 1j * U[..., 1]  # [M, R]
+    V_complex = V[..., 0] + 1j * V[..., 1]  # [N, R]
+    H_ideal_complex = H_ideal[..., 0] + 1j * H_ideal[..., 1]  # [M, N]
 
-    # SVD重构
-    S_diag = torch.diag(S.to(torch.complex64))
-    H_recon = U_complex @ S_diag @ V_complex.conj().T
+    # SVD重构: H = U @ diag(S) @ V^H
+    # 使用爱因斯坦求和避免维度问题
+    H_recon = torch.einsum('mr,r,nr->mn', U_complex, S, V_complex.conj())
 
-    # 重构损失 - 使用相对误差
+    # 重构损失
     recon_error = torch.norm(H_ideal_complex - H_recon, p='fro')
     ideal_norm = torch.norm(H_ideal_complex, p='fro')
     recon_loss = recon_error / (ideal_norm + 1e-8)
@@ -144,7 +107,7 @@ def compute_loss(U, S, V, H_ideal, lambda_ortho=0.5):
     U_ortho_loss = torch.norm(U_gram - I, p='fro')
     V_ortho_loss = torch.norm(V_gram - I, p='fro')
 
-    # 奇异值单调性约束
+    # 奇异值约束
     if R > 1:
         monotonic_loss = torch.sum(F.relu(S[1:] - S[:-1] + 1e-6))
     else:
@@ -158,15 +121,13 @@ def compute_loss(U, S, V, H_ideal, lambda_ortho=0.5):
 
 
 def compute_ae_metric(U, S, V, H_ideal):
-    """计算AE指标"""
     # 转换为复数
     U_complex = U[..., 0] + 1j * U[..., 1]
     V_complex = V[..., 0] + 1j * V[..., 1]
     H_ideal_complex = H_ideal[..., 0] + 1j * H_ideal[..., 1]
 
     # 重构
-    S_diag = torch.diag(S.to(torch.complex64))
-    H_recon = U_complex @ S_diag @ V_complex.conj().T
+    H_recon = torch.einsum('mr,r,nr->mn', U_complex, S, V_complex.conj())
 
     # AE计算
     recon_error = torch.norm(H_ideal_complex - H_recon, p='fro') / torch.norm(H_ideal_complex, p='fro')

@@ -49,11 +49,11 @@ def simple_train(scene_idx=1, round_idx=1):
 
     # 优化器 - 稍微提升学习率
     optimizer = optim.AdamW(model.parameters(), lr=1.5e-3, weight_decay=1e-5)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=25, eta_min=1e-6)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=20, eta_min=1e-6)
 
-    # 训练参数 - 关键优化
-    num_epochs = 25  # 减少epoch
-    batch_size = 32  # 增大batch size - 这是关键！
+    # 训练参数 - 更激进的设置
+    num_epochs = 20  # 进一步减少
+    batch_size = 64  # 更大的batch
 
     print(f"Starting training for {num_epochs} epochs, batch_size={batch_size}...")
 
@@ -88,9 +88,9 @@ def simple_train(scene_idx=1, round_idx=1):
                 # 前向传播
                 U_out, S_out, V_out = model(H_data)
 
-                # 计算损失
+                # 计算损失 - 使用增强损失函数
                 loss, recon_loss, U_ortho_loss, V_ortho_loss = compute_loss(
-                    U_out, S_out, V_out, H_label, lambda_ortho=0.3
+                    U_out, S_out, V_out, H_label, lambda_ortho=0.6, lambda_energy=0.05
                 )
 
                 batch_loss += loss

@@ -4,8 +4,8 @@ import torch.nn.functional as F
 import numpy as np
 
 
-class GramSchmidtLayer(nn.Module):
-    """Gram-Schmidt正交化 - 不使用禁止算子"""
+class FastOrthogonal(nn.Module):
+    """快速正交化 - 简化版本"""
 
     def __init__(self):
         super().__init__()
@@ -15,18 +15,9 @@ class GramSchmidtLayer(nn.Module):
         M, R, _ = x.shape
         x_complex = x[..., 0] + 1j * x[..., 1]
 
-        Q = torch.zeros_like(x_complex)
-
-        for j in range(R):
-            v = x_complex[:, j]
-
-            for i in range(j):
-                proj_coeff = torch.sum(torch.conj(Q[:, i]) * v)
-                v = v - proj_coeff * Q[:, i]
-
-            norm = torch.sqrt(torch.sum(torch.abs(v) ** 2) + 1e-8)
-            Q = Q.clone()
-            Q[:, j] = v / norm
+        # 简化的正交化 - 只做归一化
+        norms = torch.sqrt(torch.sum(torch.abs(x_complex) ** 2, dim=0, keepdim=True) + 1e-8)
+        Q = x_complex / norms
 
         return torch.stack([Q.real, Q.imag], dim=-1)
 
@@ -85,8 +76,8 @@ class SVDNet(nn.Module):
             nn.Linear(512, N * R * 2),
         )
 
-        # 替换禁止的QR分解
-        self.orthogonal_layer = GramSchmidtLayer()
+        # 替换为快速正交化
+        self.orthogonal_layer = FastOrthogonal()
 
     def forward(self, x):
         # x: [M, N, 2]

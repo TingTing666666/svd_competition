@@ -46,7 +46,7 @@ def simple_train(scene_idx=1, round_idx=1):
     print(f"Training Scene {scene_idx} of Round {round_idx}")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Device: {device}")
+    print(f"Using device: {device}")
 
     # 数据路径
     data_dir = f"./CompetitionData{round_idx}"
@@ -63,12 +63,13 @@ def simple_train(scene_idx=1, round_idx=1):
     print(f"Config: samp_num={samp_num}, M={M}, N={N}, R={R}")
 
     # 加载数据
+    print("Loading data...")
     train_data = np.load(train_data_path).astype(np.float32)
     train_label = np.load(train_label_path).astype(np.float32)
-    print(f"Data loaded: {train_data.shape}")
+    print(f"Data shapes: data={train_data.shape}, label={train_label.shape}")
 
-    # 数据采样 - 使用部分数据快速训练
-    sample_size = min(8000, samp_num)
+    # 数据采样 - 使用更多数据
+    sample_size = min(10000, samp_num)
     indices = np.random.choice(samp_num, sample_size, replace=False)
     train_data = train_data[indices]
     train_label = train_label[indices]
@@ -90,19 +91,19 @@ def simple_train(scene_idx=1, round_idx=1):
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {total_params:,}")
 
-    # 优化器
+    # 优化器和调度器
     optimizer = optim.AdamW(model.parameters(), lr=2e-3, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50, eta_min=1e-6)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=40, eta_min=1e-6)
 
     # 训练参数
-    num_epochs = 50
-    batch_size = 32
+    num_epochs = 40
+    batch_size = 32  # 增大batch_size提升效率
 
     print(f"Training: {num_epochs} epochs, batch_size={batch_size}")
 
     # 训练循环
     best_val_ae = float('inf')
-    patience = 12
+    patience = 10
     patience_counter = 0
 
     for epoch in range(num_epochs):
@@ -112,7 +113,7 @@ def simple_train(scene_idx=1, round_idx=1):
         epoch_ae = 0.0
         num_batches = 0
 
-        # 打乱训练数据
+        # 随机打乱数据
         train_indices_epoch = np.random.permutation(len(train_data))
 
         pbar = tqdm(range(0, len(train_data), batch_size),
@@ -127,6 +128,7 @@ def simple_train(scene_idx=1, round_idx=1):
             batch_loss = 0.0
             batch_ae = 0.0
 
+            # 处理批次中的每个样本
             for idx in batch_indices:
                 H_data = torch.FloatTensor(train_data[idx]).to(device)
                 H_label = torch.FloatTensor(train_label[idx]).to(device)
@@ -139,6 +141,7 @@ def simple_train(scene_idx=1, round_idx=1):
                     U_out, S_out, V_out, H_label, lambda_ortho=0.4
                 )
 
+                # 梯度累积
                 loss = loss / len(batch_indices)
                 loss.backward()
 
@@ -201,8 +204,9 @@ def train_all_scenes(round_idx=1):
     scenes = [1, 2, 3]
 
     for scene_idx in scenes:
-        print(f"\nTraining Scene {scene_idx}")
-        print("=" * 50)
+        print(f"\n{'=' * 50}")
+        print(f"Training Scene {scene_idx}")
+        print(f"{'=' * 50}")
 
         try:
             model = simple_train(scene_idx, round_idx)
@@ -220,7 +224,7 @@ def train_all_scenes(round_idx=1):
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description='SVD Training')
+    parser = argparse.ArgumentParser(description='Simple SVD Training')
     parser.add_argument('--scene', type=int, default=None, help='Scene number (if None, train all)')
     parser.add_argument('--round', type=int, default=1, help='Round number')
 

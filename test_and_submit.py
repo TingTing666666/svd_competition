@@ -21,7 +21,7 @@ def test_model(round_idx=1, scene_idx=1):
     print(f"Testing Scene {scene_idx} (Round {round_idx})")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Device: {device}")
+    print(f"Using device: {device}")
 
     # 数据路径
     data_dir = f"./CompetitionData{round_idx}"

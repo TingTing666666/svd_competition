@@ -1,4 +1,4 @@
-# SVD竞赛启动指南
+# SVD竞赛main_stable_v3_mini启动指南
 
 ## 快速开始
 

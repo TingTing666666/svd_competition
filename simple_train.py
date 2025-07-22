@@ -8,24 +8,19 @@ from solution import SVDNet, compute_loss, compute_ae_metric
 
 
 def read_cfg_file(file_path):
-    """读取配置文件"""
     with open(file_path, 'r') as file:
         lines = file.readlines()
-
     samp_num = int(lines[0].strip())
     M = int(lines[1].strip())
     N = int(lines[2].strip())
     IQ = int(lines[3].strip())
     R = int(lines[4].strip())
-
     return samp_num, M, N, IQ, R
 
 
 def simple_train(scene_idx=1, round_idx=1):
-    """简单训练函数"""
     print(f"Training Scene {scene_idx} of Round {round_idx}")
 
-    # 设备
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
@@ -35,7 +30,6 @@ def simple_train(scene_idx=1, round_idx=1):
     train_data_path = f"{data_dir}/Round{round_idx}TrainData{scene_idx}.npy"
     train_label_path = f"{data_dir}/Round{round_idx}TrainLabel{scene_idx}.npy"
 
-    # 检查文件是否存在
     if not all(os.path.exists(f) for f in [cfg_path, train_data_path, train_label_path]):
         print("Some data files are missing!")
         return None
@@ -46,23 +40,22 @@ def simple_train(scene_idx=1, round_idx=1):
 
     # 加载数据
     print("Loading training data...")
-    train_data = np.load(train_data_path)  # [N_samp, M, N, 2]
-    train_label = np.load(train_label_path)  # [N_samp, M, N, 2]
-
+    train_data = np.load(train_data_path).astype(np.float32)
+    train_label = np.load(train_label_path).astype(np.float32)
     print(f"Data shapes: data={train_data.shape}, label={train_label.shape}")
 
     # 创建模型
     model = SVDNet(M=M, N=N, R=R).to(device)
 
-    # 优化器
-    optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.8)
+    # 优化器 - 稍微提升学习率
+    optimizer = optim.AdamW(model.parameters(), lr=1.5e-3, weight_decay=1e-5)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=25, eta_min=1e-6)
 
-    # 训练参数
-    num_epochs = 30
-    batch_size = 8  # 小批量以节省内存
+    # 训练参数 - 关键优化
+    num_epochs = 25  # 减少epoch
+    batch_size = 32  # 增大batch size - 这是关键！
 
-    print(f"Starting training for {num_epochs} epochs...")
+    print(f"Starting training for {num_epochs} epochs, batch_size={batch_size}...")
 
     # 训练循环
     model.train()
@@ -89,16 +82,15 @@ def simple_train(scene_idx=1, round_idx=1):
 
             # 处理批次中的每个样本
             for idx in batch_indices:
-                # 获取单个样本
-                H_data = torch.FloatTensor(train_data[idx]).to(device)  # [M, N, 2]
-                H_label = torch.FloatTensor(train_label[idx]).to(device)  # [M, N, 2]
+                H_data = torch.FloatTensor(train_data[idx]).to(device)
+                H_label = torch.FloatTensor(train_label[idx]).to(device)
 
                 # 前向传播
                 U_out, S_out, V_out = model(H_data)
 
                 # 计算损失
                 loss, recon_loss, U_ortho_loss, V_ortho_loss = compute_loss(
-                    U_out, S_out, V_out, H_label, lambda_ortho=0.1
+                    U_out, S_out, V_out, H_label, lambda_ortho=0.3
                 )
 
                 batch_loss += loss
@@ -151,22 +143,20 @@ def simple_train(scene_idx=1, round_idx=1):
 
 
 def train_all_scenes(round_idx=1):
-    """训练所有场景"""
     scenes = [1, 2, 3]
 
     for scene_idx in scenes:
-        print(f"\n{'=' * 50}")
-        print(f"Training Scene {scene_idx}")
-        print(f"{'=' * 50}")
+        print(f"\nTraining Scene {scene_idx}")
+        print("=" * 50)
 
         try:
             model = simple_train(scene_idx, round_idx)
             if model is not None:
-                print(f"✓ Scene {scene_idx} training completed successfully")
+                print(f"Scene {scene_idx} training completed successfully")
             else:
-                print(f"✗ Scene {scene_idx} training failed")
+                print(f"Scene {scene_idx} training failed")
         except Exception as e:
-            print(f"✗ Error training scene {scene_idx}: {e}")
+            print(f"Error training scene {scene_idx}: {e}")
             continue
 
     print("\nAll scenes training completed!")

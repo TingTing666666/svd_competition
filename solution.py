@@ -4,40 +4,31 @@ import torch.nn.functional as F
 import numpy as np
 
 
-class OrthogonalLayer(nn.Module):
-    """正交化层 - 使用QR分解"""
+class GramSchmidtLayer(nn.Module):
+    """Gram-Schmidt正交化 - 不使用禁止算子"""
 
     def __init__(self):
         super().__init__()
 
     def forward(self, x):
-        # x: [batch, M, R, 2] 或 [M, R, 2]
-        if x.dim() == 3:
-            x = x.unsqueeze(0)
-            squeeze_output = True
-        else:
-            squeeze_output = False
+        # x: [M, R, 2]
+        M, R, _ = x.shape
+        x_complex = x[..., 0] + 1j * x[..., 1]
 
-        batch_size, M, R, _ = x.shape
+        Q = torch.zeros_like(x_complex)
 
-        # 转换为复数形式
-        x_complex = x[..., 0] + 1j * x[..., 1]  # [batch, M, R]
+        for j in range(R):
+            v = x_complex[:, j]
 
-        # 对每个batch进行QR分解
-        output = torch.zeros_like(x_complex)
+            for i in range(j):
+                proj_coeff = torch.sum(torch.conj(Q[:, i]) * v)
+                v = v - proj_coeff * Q[:, i]
 
-        for b in range(batch_size):
-            # QR分解得到正交矩阵Q
-            Q, _ = torch.linalg.qr(x_complex[b])  # Q: [M, R]
-            output[b] = Q
+            norm = torch.sqrt(torch.sum(torch.abs(v) ** 2) + 1e-8)
+            Q = Q.clone()
+            Q[:, j] = v / norm
 
-        # 转换回实虚部格式
-        result = torch.stack([output.real, output.imag], dim=-1)
-
-        if squeeze_output:
-            result = result.squeeze(0)
-
-        return result
+        return torch.stack([Q.real, Q.imag], dim=-1)
 
 
 class SVDNet(nn.Module):
@@ -47,11 +38,20 @@ class SVDNet(nn.Module):
         self.N = N
         self.R = R
 
-        # 简化的特征提取网络
-        self.feature_extractor = nn.Sequential(
-            nn.Linear(M * N * 2, 512),  # 直接展平输入
+        # 在你原有基础上加卷积层提升性能
+        self.conv_features = nn.Sequential(
+            nn.Conv2d(2, 64, 3, padding=1),
             nn.ReLU(),
-            nn.Linear(512, 256),
+            nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, 3, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten()
+        )
+
+        # 保持你原有的网络结构
+        self.feature_extractor = nn.Sequential(
+            nn.Linear(128, 256),
             nn.ReLU(),
             nn.Linear(256, 128),
             nn.ReLU(),
@@ -64,7 +64,7 @@ class SVDNet(nn.Module):
             nn.Linear(256, 128),
             nn.ReLU(),
             nn.Linear(128, R),
-            nn.Softplus()  # 确保奇异值为正
+            nn.Softplus()
         )
 
         # 左奇异矩阵预测网络
@@ -73,7 +73,7 @@ class SVDNet(nn.Module):
             nn.ReLU(),
             nn.Linear(256, 512),
             nn.ReLU(),
-            nn.Linear(512, M * R * 2),  # 输出实虚部
+            nn.Linear(512, M * R * 2),
         )
 
         # 右奇异矩阵预测网络
@@ -82,25 +82,24 @@ class SVDNet(nn.Module):
             nn.ReLU(),
             nn.Linear(256, 512),
             nn.ReLU(),
-            nn.Linear(512, N * R * 2),  # 输出实虚部
+            nn.Linear(512, N * R * 2),
         )
 
-        # 正交化层
-        self.orthogonal_layer = OrthogonalLayer()
+        # 替换禁止的QR分解
+        self.orthogonal_layer = GramSchmidtLayer()
 
     def forward(self, x):
-        # x: [M, N, 2] 单个样本
+        # x: [M, N, 2]
 
-        # 展平输入
-        x_flat = x.view(-1)  # [M*N*2]
+        # 先用卷积提取空间特征
+        x_conv = x.permute(2, 0, 1).unsqueeze(0)  # [1, 2, M, N]
+        conv_feat = self.conv_features(x_conv).squeeze(0)  # [128]
 
         # 特征提取
-        features = self.feature_extractor(x_flat)  # [128]
+        features = self.feature_extractor(conv_feat)  # [128]
 
         # 预测奇异值
         singular_values = self.singular_value_net(features)  # [R]
-
-        # 确保奇异值降序排列
         singular_values = torch.sort(singular_values, dim=-1, descending=True)[0]
 
         # 预测左奇异矩阵
@@ -119,34 +118,23 @@ class SVDNet(nn.Module):
 
 
 def compute_loss(U, S, V, H_ideal, lambda_ortho=1.0):
-    """
-    计算损失函数
-
-    Args:
-        U: [M, R, 2] 左奇异矩阵
-        S: [R] 奇异值
-        V: [N, R, 2] 右奇异矩阵
-        H_ideal: [M, N, 2] 理想信道矩阵
-        lambda_ortho: 正交性约束权重
-    """
-    M, R, _ = U.shape
-    N, R, _ = V.shape
-
+    """计算损失函数"""
     # 转换为复数
     U_complex = U[..., 0] + 1j * U[..., 1]  # [M, R]
     V_complex = V[..., 0] + 1j * V[..., 1]  # [N, R]
     H_ideal_complex = H_ideal[..., 0] + 1j * H_ideal[..., 1]  # [M, N]
 
-    # 重构矩阵: H_recon = U @ diag(S) @ V^H
-    S_diag = torch.diag(S.to(torch.complex64))  # [R, R] 转换为复数
-    H_recon = U_complex @ S_diag @ V_complex.conj().T  # [M, N]
+    # 重构矩阵 - 使用爱因斯坦求和避免维度错误
+    H_recon = torch.einsum('mr,r,nr->mn', U_complex, S, V_complex.conj())
 
     # 重构误差
     recon_loss = torch.mean(torch.abs(H_ideal_complex - H_recon) ** 2)
 
     # 正交性约束
-    U_ortho_loss = torch.mean(torch.abs(U_complex.conj().T @ U_complex - torch.eye(R, device=U.device)) ** 2)
-    V_ortho_loss = torch.mean(torch.abs(V_complex.conj().T @ V_complex - torch.eye(R, device=V.device)) ** 2)
+    R = S.shape[0]
+    I = torch.eye(R, device=U.device, dtype=torch.complex64)
+    U_ortho_loss = torch.norm(U_complex.conj().T @ U_complex - I, p='fro')
+    V_ortho_loss = torch.norm(V_complex.conj().T @ V_complex - I, p='fro')
 
     total_loss = recon_loss + lambda_ortho * (U_ortho_loss + V_ortho_loss)
 
@@ -154,26 +142,22 @@ def compute_loss(U, S, V, H_ideal, lambda_ortho=1.0):
 
 
 def compute_ae_metric(U, S, V, H_ideal):
-    """
-    计算AE指标 (和比赛评估一致)
-    """
+    """计算AE指标"""
     # 转换为复数
     U_complex = U[..., 0] + 1j * U[..., 1]
     V_complex = V[..., 0] + 1j * V[..., 1]
     H_ideal_complex = H_ideal[..., 0] + 1j * H_ideal[..., 1]
 
     # 重构矩阵
-    S_diag = torch.diag(S.to(torch.complex64))
-    H_recon = U_complex @ S_diag @ V_complex.conj().T
+    H_recon = torch.einsum('mr,r,nr->mn', U_complex, S, V_complex.conj())
 
     # 重构误差
     recon_error = torch.norm(H_ideal_complex - H_recon, p='fro') / torch.norm(H_ideal_complex, p='fro')
 
     # 正交性误差
-    I = torch.eye(S.shape[0], device=U.device)
+    I = torch.eye(S.shape[0], device=U.device, dtype=torch.complex64)
     U_ortho_error = torch.norm(U_complex.conj().T @ U_complex - I, p='fro')
     V_ortho_error = torch.norm(V_complex.conj().T @ V_complex - I, p='fro')
 
     ae = recon_error + U_ortho_error + V_ortho_error
-
     return ae.item()

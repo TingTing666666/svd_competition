@@ -52,6 +52,10 @@ def test_model(round_idx=1, scene_idx=1):
         for samp_idx in tqdm(range(actual_samp_num), desc="Processing"):
             H_data = torch.FloatTensor(test_data[samp_idx]).to(device)
 
+            # 检查并修正输入形状
+            if H_data.dim() == 4:
+                H_data = H_data.squeeze(0)  # [1, M, N, 2] -> [M, N, 2]
+
             # Validate input shape
             assert H_data.shape == (M, N, IQ), f"Input shape error: expected ({M}, {N}, {IQ}), got {H_data.shape}"
 

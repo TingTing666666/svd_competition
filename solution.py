@@ -44,7 +44,7 @@ class SVDNet(nn.Module):
         self.N = N
         self.R = R
 
-        # 增强卷积特征提取
+        # 增强卷积特征提取 - 修正输入处理
         self.conv_backbone = nn.Sequential(
             nn.Conv2d(2, 64, 3, padding=1),
             nn.ReLU(),
@@ -102,9 +102,9 @@ class SVDNet(nn.Module):
         self.residual_weight = nn.Parameter(torch.ones(1) * 0.1)
 
     def forward(self, x):
-        # x: [M, N, 2]
-        # 转换为卷积输入格式
-        x_conv = x.permute(2, 0, 1).unsqueeze(0)  # [1, 2, M, N]
+        # x: [M, N, 2] - 根据文档，这是单个样本的输入格式
+        # 转换为卷积输入格式 [1, 2, M, N]
+        x_conv = x.permute(2, 0, 1).unsqueeze(0)  # [M, N, 2] -> [2, M, N] -> [1, 2, M, N]
 
         # 增强特征提取
         conv_features = self.conv_backbone(x_conv).squeeze(0)  # [256]

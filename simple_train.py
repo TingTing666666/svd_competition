@@ -18,60 +18,59 @@ def read_cfg_file(file_path):
     return samp_num, M, N, IQ, R
 
 
-def simple_train(scene_idx=1, round_idx=1):
-    print(f"Training Scene {scene_idx} of Round {round_idx}")
-
+def train_scene(scene_idx=1, round_idx=1):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
 
-    # 数据路径
+    # Data paths
     data_dir = f"./CompetitionData{round_idx}"
     cfg_path = f"{data_dir}/Round{round_idx}CfgData{scene_idx}.txt"
     train_data_path = f"{data_dir}/Round{round_idx}TrainData{scene_idx}.npy"
     train_label_path = f"{data_dir}/Round{round_idx}TrainLabel{scene_idx}.npy"
 
     if not all(os.path.exists(f) for f in [cfg_path, train_data_path, train_label_path]):
-        print("Some data files are missing!")
+        print(f"Missing data files for scene {scene_idx}")
         return None
 
-    # 读取配置
+    # Load config and data
     samp_num, M, N, IQ, R = read_cfg_file(cfg_path)
-    print(f"Config: samp_num={samp_num}, M={M}, N={N}, R={R}")
-
-    # 加载数据
-    print("Loading training data...")
     train_data = np.load(train_data_path).astype(np.float32)
     train_label = np.load(train_label_path).astype(np.float32)
-    print(f"Data shapes: data={train_data.shape}, label={train_label.shape}")
 
-    # 创建模型
+    # Create model
     model = SVDNet(M=M, N=N, R=R).to(device)
 
-    # 优化器 - 稍微提升学习率
-    optimizer = optim.AdamW(model.parameters(), lr=1.5e-3, weight_decay=1e-5)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=20, eta_min=1e-6)
+    # Optimizer with layered learning rates
+    param_groups = [
+        {'params': list(model.backbone.parameters()), 'lr': 5e-4, 'weight_decay': 1e-4},
+        {'params': list(model.feature_net.parameters()), 'lr': 8e-4, 'weight_decay': 5e-5},
+        {'params': list(model.s_net.parameters()) + list(model.u_net.parameters()) + list(model.v_net.parameters()),
+         'lr': 1e-3, 'weight_decay': 1e-5},
+        {'params': list(model.orthogonal.parameters()), 'lr': 1.5e-3, 'weight_decay': 0},
+        {'params': [model.s_scale], 'lr': 2e-3, 'weight_decay': 0}
+    ]
 
-    # 训练参数 - 更激进的设置
-    num_epochs = 20  # 进一步减少
-    batch_size = 64  # 更大的batch
+    optimizer = optim.AdamW(param_groups)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=30, eta_min=1e-6)
 
-    print(f"Starting training for {num_epochs} epochs, batch_size={batch_size}...")
+    # Training config
+    num_epochs = 30
+    batch_size = 32
+    best_ae = float('inf')
 
-    # 训练循环
     model.train()
-    best_loss = float('inf')
-
     for epoch in range(num_epochs):
         epoch_loss = 0.0
         epoch_ae = 0.0
         num_batches = 0
 
-        # 随机打乱数据
+        # Adaptive loss weights
+        progress = epoch / num_epochs
+        lambda_ortho = 0.8 + 0.6 * progress  # 0.8 -> 1.4
+        lambda_energy = 0.05 + 0.05 * progress  # 0.05 -> 0.1
+
         indices = np.random.permutation(samp_num)
 
-        pbar = tqdm(range(0, samp_num, batch_size), desc=f"Epoch {epoch + 1}/{num_epochs}")
-
-        for batch_start in pbar:
+        for batch_start in tqdm(range(0, samp_num, batch_size), desc=f"Epoch {epoch + 1}/{num_epochs}"):
             batch_end = min(batch_start + batch_size, samp_num)
             batch_indices = indices[batch_start:batch_end]
 
@@ -80,98 +79,67 @@ def simple_train(scene_idx=1, round_idx=1):
 
             optimizer.zero_grad()
 
-            # 处理批次中的每个样本
             for idx in batch_indices:
                 H_data = torch.FloatTensor(train_data[idx]).to(device)
                 H_label = torch.FloatTensor(train_label[idx]).to(device)
 
-                # 前向传播
                 U_out, S_out, V_out = model(H_data)
 
-                # 计算损失 - 使用增强损失函数
                 loss, recon_loss, U_ortho_loss, V_ortho_loss = compute_loss(
-                    U_out, S_out, V_out, H_label, lambda_ortho=0.6, lambda_energy=0.05
+                    U_out, S_out, V_out, H_label,
+                    lambda_ortho=lambda_ortho, lambda_energy=lambda_energy
                 )
 
                 batch_loss += loss
-
-                # 计算AE指标
                 ae = compute_ae_metric(U_out, S_out, V_out, H_label)
                 batch_ae += ae
 
-            # 平均损失
             batch_loss = batch_loss / len(batch_indices)
             batch_ae = batch_ae / len(batch_indices)
 
-            # 反向传播
             batch_loss.backward()
-
-            # 梯度裁剪
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
             optimizer.step()
 
             epoch_loss += batch_loss.item()
             epoch_ae += batch_ae
             num_batches += 1
 
-            # 更新进度条
-            pbar.set_postfix({
-                'Loss': f'{batch_loss.item():.4f}',
-                'AE': f'{batch_ae:.4f}',
-                'LR': f'{optimizer.param_groups[0]["lr"]:.1e}'
-            })
-
-        # 学习率调度
         scheduler.step()
 
-        # 计算平均指标
         avg_loss = epoch_loss / num_batches
         avg_ae = epoch_ae / num_batches
 
-        print(f"Epoch {epoch + 1}/{num_epochs}: Loss={avg_loss:.4f}, AE={avg_ae:.4f}")
+        print(f"Epoch {epoch + 1}: Loss={avg_loss:.5f}, AE={avg_ae:.5f}")
 
-        # 保存最佳模型
-        if avg_loss < best_loss:
-            best_loss = avg_loss
+        if avg_ae < best_ae:
+            best_ae = avg_ae
             model_path = f"svd_model_round{round_idx}_scene{scene_idx}.pth"
             torch.save(model.state_dict(), model_path)
-            print(f"Best model saved: {model_path}")
 
-    print(f"Training completed! Best loss: {best_loss:.4f}")
+    print(f"Scene {scene_idx} completed. Best AE: {best_ae:.5f}")
     return model
 
 
 def train_all_scenes(round_idx=1):
     scenes = [1, 2, 3]
-
     for scene_idx in scenes:
         print(f"\nTraining Scene {scene_idx}")
-        print("=" * 50)
-
         try:
-            model = simple_train(scene_idx, round_idx)
-            if model is not None:
-                print(f"Scene {scene_idx} training completed successfully")
-            else:
-                print(f"Scene {scene_idx} training failed")
+            train_scene(scene_idx, round_idx)
         except Exception as e:
             print(f"Error training scene {scene_idx}: {e}")
-            continue
-
-    print("\nAll scenes training completed!")
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description='Simple SVD Training')
-    parser.add_argument('--scene', type=int, default=None, help='Scene number (if None, train all)')
-    parser.add_argument('--round', type=int, default=1, help='Round number')
-
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--scene', type=int, default=None)
+    parser.add_argument('--round', type=int, default=1)
     args = parser.parse_args()
 
     if args.scene is not None:
-        simple_train(args.scene, args.round)
+        train_scene(args.scene, args.round)
     else:
         train_all_scenes(args.round)

@@ -39,13 +39,13 @@ def train_scene(scene_idx=1, round_idx=1):
     # 创建模型
     model = SVDNet(M=M, N=N, R=R).to(device)
 
-    # 简化的优化器
-    optimizer = optim.AdamW(model.parameters(), lr=2e-3, weight_decay=1e-5)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=15, eta_min=1e-6)
+    # 调整优化器 - 平衡学习率
+    optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-6)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=20, eta_min=1e-8)
 
-    # 快速训练配置
-    num_epochs = 15  # 减少epoch数
-    batch_size = 128  # 增大batch size
+    # 训练配置
+    num_epochs = 20  # 增加到20个epoch
+    batch_size = 64  # 减小batch size让训练更稳定
     best_ae = float('inf')
 
     # 数据子采样 - 只使用一部分数据加速训练
@@ -61,8 +61,8 @@ def train_scene(scene_idx=1, round_idx=1):
         epoch_ae = 0.0
         num_batches = 0
 
-        # 自适应权重
-        lambda_ortho = 0.3 + 0.4 * (epoch / num_epochs)  # 0.3 -> 0.7
+        # 去掉自适应权重 - 直接优化AE
+        # lambda_ortho = 0.05 + 0.05 * (epoch / num_epochs)  # 不再需要
 
         indices = np.random.permutation(samp_num)
 
@@ -84,7 +84,7 @@ def train_scene(scene_idx=1, round_idx=1):
 
                 U_out, S_out, V_out = model(H_data)
 
-                loss, _, _, _ = compute_loss(U_out, S_out, V_out, H_label, lambda_ortho=lambda_ortho)
+                loss, _, _, _ = compute_loss(U_out, S_out, V_out, H_label)  # 去掉lambda_ortho参数
                 batch_losses.append(loss)
 
                 # 每5个样本计算一次AE（减少计算）
@@ -97,8 +97,8 @@ def train_scene(scene_idx=1, round_idx=1):
                 batch_loss = torch.stack(batch_losses).mean()
                 batch_loss.backward()
 
-                # 梯度裁剪
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                # 梯度裁剪 - 更保守
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
                 optimizer.step()
 
                 epoch_loss += batch_loss.item()

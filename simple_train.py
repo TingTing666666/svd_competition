@@ -1,4 +1,8 @@
+# simple_train.py
+
 import os
+import math
+import argparse
 import numpy as np
 import torch
 import torch.optim as optim
@@ -6,8 +10,8 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from solution import SVDNet, compute_loss, compute_ae_metric
 
-def read_cfg_file(file_path):
-    with open(file_path, 'r', encoding='utf-8-sig') as f:
+def read_cfg_file(path):
+    with open(path, 'r', encoding='utf-8-sig') as f:
         nums = [l.strip() for l in f if l.strip()]
     return int(nums[0]), int(nums[1]), int(nums[2]), int(nums[3]), int(nums[4])
 
@@ -15,121 +19,136 @@ class HDataset(Dataset):
     def __init__(self, data, label):
         self.data = data
         self.label = label
-
     def __len__(self):
         return self.data.shape[0]
-
     def __getitem__(self, i):
         return torch.from_numpy(self.data[i]), torch.from_numpy(self.label[i])
 
 def normalize(H: torch.Tensor) -> torch.Tensor:
-    """
-    归一化复数张量 H，使得每个样本的 Frobenius 范数 = 1。
-    H: [B, M, N, 2] 或 [M, N, 2]
-    """
-    if H.dim() == 4:
-        B, M, N, _ = H.shape
-        flat = H.view(B, -1, 2)
-        # 每个样本的平方和
-        sq = flat[...,0]**2 + flat[...,1]**2  # [B, M*N]
-        fro = torch.sqrt(sq.sum(dim=1, keepdim=True))  # [B,1]
-        return (flat / (fro.unsqueeze(-1) + 1e-8)).view_as(H)
-    else:
-        # 单样本模式
-        flat = H.view(-1, 2)
-        sq = flat[...,0]**2 + flat[...,1]**2
-        fro = torch.sqrt(sq.sum())
-        return H / (fro + 1e-8)
+    # Frobenius 归一化：每个样本 ||H||_F = 1
+    B, M, N, _ = H.shape
+    flat = H.view(B, -1, 2)
+    sq = flat[...,0]**2 + flat[...,1]**2
+    fro = torch.sqrt(sq.sum(dim=1, keepdim=True))  # [B,1]
+    return (flat / (fro.unsqueeze(-1) + 1e-8)).view_as(H)
 
-def simple_train(scene_idx=1, round_idx=1):
-    print(">>> Enter simple_train")
+def simple_train(round_idx: int, scene_idx: int):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+    # 读取配置与数据
     data_dir = f"./CompetitionData{round_idx}"
-    cfg_path  = f"{data_dir}/Round{round_idx}CfgData{scene_idx}.txt"
-    data_path = f"{data_dir}/Round{round_idx}TrainData{scene_idx}.npy"
-    lab_path  = f"{data_dir}/Round{round_idx}TrainLabel{scene_idx}.npy"
+    N_samp, M, N, IQ, R = read_cfg_file(
+        os.path.join(data_dir, f"Round{round_idx}CfgData{scene_idx}.txt")
+    )
+    X = np.load(os.path.join(data_dir, f"Round{round_idx}TrainData{scene_idx}.npy")).astype(np.float32)
+    Y = np.load(os.path.join(data_dir, f"Round{round_idx}TrainLabel{scene_idx}.npy")).astype(np.float32)
+    print(f"Scene {scene_idx} data shape:", X.shape)
 
-    print("cfg_path =", cfg_path)
-    print("data_path =", data_path)
-    print("lab_path  =", lab_path)
+    ds = HDataset(X, Y)
+    dl = DataLoader(ds, batch_size=256, shuffle=True, num_workers=0)
 
-    if not all(os.path.exists(p) for p in [cfg_path, data_path, lab_path]):
-        print("Some data files are missing!")
-        return
+    # 构建轻量化模型
+    model = SVDNet(M, N, R, hidden=96, num_blocks=2, ortho_iter=1).to(device)
 
-    samp, M, N, IQ, R = read_cfg_file(cfg_path)
-    print("cfg =", samp, M, N, IQ, R)
+    # 优化器 & 调度器
+    opt = optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-5)
+    epochs_total = 40
+    # CosineAnnealingLR over 40 epochs
+    sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs_total)
 
-    train_data  = np.load(data_path).astype(np.float32)
-    train_label = np.load(lab_path).astype(np.float32)
-    print("data shapes:", train_data.shape, train_label.shape)
+    scaler = torch.amp.GradScaler()
 
-    ds = HDataset(train_data, train_label)
-    dl = DataLoader(ds, batch_size=256, shuffle=True, num_workers=0, drop_last=False)
+    # —— Stage 1: 冻结 U/V 头 ——
+    for name, p in model.named_parameters():
+        if name.startswith("head_U") or name.startswith("head_V"):
+            p.requires_grad = False
 
-    model = SVDNet(M=M, N=N, R=R).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=2e-3, weight_decay=1e-5)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=30, eta_min=1e-6)
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type=='cuda'))
-
-    best_loss = float('inf')
-    epochs = 30
-
-    for ep in range(epochs):
+    best_stage1 = float('inf')
+    for ep in range(20):
         model.train()
-        total_loss = 0.0
-        total_ae   = 0.0
-        batches    = 0
+        tot_loss = 0.0
+        tot_ae   = 0.0
+        nb = 0
+        pbar = tqdm(dl, desc=f"Stage1 Ep{ep+1}/20")
+        for x_np, y_np in pbar:
+            Hx = normalize(x_np.to(device))
+            Hy = normalize(y_np.to(device))
 
-        pbar = tqdm(dl, desc=f"S{scene_idx} Ep{ep+1}/{epochs}")
-        for H_in_np, H_lab_np in pbar:
-            # 转 tensor + 放设备
-            H_in  = H_in_np.to(device)
-            H_lab = H_lab_np.to(device)
-
-            # 统一归一化
-            H_in  = normalize(H_in)
-            H_lab = normalize(H_lab)
-
-            optimizer.zero_grad()
-            with torch.cuda.amp.autocast(enabled=(device.type=='cuda')):
-                U_b, S_b, V_b = model(H_in)   # 支持 batch forward
-                loss, rec, uo, vo = compute_loss(U_b, S_b, V_b, H_lab, lambda_ortho=0.3)
-
+            opt.zero_grad()
+            with torch.amp.autocast(device_type=device.type, enabled=(device.type=='cuda')):
+                U, S, V = model(Hx)
+                loss, rec, uo, vo = compute_loss(U, S, V, Hy, lambda_ortho=0.1)
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in model.parameters() if p.requires_grad], 1.0)
+            scaler.step(opt)
             scaler.update()
 
             with torch.no_grad():
-                ae = compute_ae_metric(U_b, S_b, V_b, H_lab)
+                ae = compute_ae_metric(U, S, V, Hy)
 
-            total_loss += loss.item()
-            total_ae   += ae
-            batches    += 1
+            tot_loss += loss.item()
+            tot_ae   += ae
+            nb += 1
             pbar.set_postfix(L=f"{loss.item():.4f}", R=f"{rec.item():.4f}")
 
-        avg_loss = total_loss / batches
-        avg_ae   = total_ae   / batches
-        print(f"Epoch {ep+1}: Loss={avg_loss:.4f}, AE={avg_ae:.4f}")
+        avg_loss = tot_loss / nb
+        avg_ae   = tot_ae   / nb
+        print(f"[Stage1 Ep{ep+1}] Loss={avg_loss:.4f}, AE={avg_ae:.4f}")
+        if avg_loss < best_stage1:
+            best_stage1 = avg_loss
+            torch.save(model.state_dict(), f"svd_stage1_r{round_idx}_s{scene_idx}.pth")
+            print("  Saved best Stage1")
+        sched.step()
 
-        # 保存最佳
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            ckpt = f"svd_model_round{round_idx}_scene{scene_idx}.pth"
-            torch.save(model.state_dict(), ckpt)
-            print("  Saved best:", ckpt)
+    # —— Stage 2: 解冻全部参数 ——
+    for p in model.parameters():
+        p.requires_grad = True
 
-        scheduler.step()
+    best_stage2 = float('inf')
+    for ep in range(20):
+        model.train()
+        tot_loss = 0.0
+        tot_ae   = 0.0
+        nb = 0
+        pbar = tqdm(dl, desc=f"Stage2 Ep{ep+1}/20")
+        for x_np, y_np in pbar:
+            Hx = normalize(x_np.to(device))
+            Hy = normalize(y_np.to(device))
 
-    print("Training done. Best loss:", best_loss)
+            opt.zero_grad()
+            with torch.amp.autocast(device_type=device.type, enabled=(device.type=='cuda')):
+                U, S, V = model(Hx)
+                loss, rec, uo, vo = compute_loss(U, S, V, Hy, lambda_ortho=0.1)
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(opt)
+            scaler.update()
+
+            with torch.no_grad():
+                ae = compute_ae_metric(U, S, V, Hy)
+
+            tot_loss += loss.item()
+            tot_ae   += ae
+            nb += 1
+            pbar.set_postfix(L=f"{loss.item():.4f}", R=f"{rec.item():.4f}")
+
+        avg_loss = tot_loss / nb
+        avg_ae   = tot_ae   / nb
+        print(f"[Stage2 Ep{ep+1}] Loss={avg_loss:.4f}, AE={avg_ae:.4f}")
+        if avg_loss < best_stage2:
+            best_stage2 = avg_loss
+            torch.save(model.state_dict(), f"svd_stage2_r{round_idx}_s{scene_idx}.pth")
+            print("  Saved best Stage2")
+        sched.step()
+
+    print("Training complete. Best Stage2 Loss:", best_stage2)
 
 if __name__ == "__main__":
-    import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--round", type=int, default=1)
     parser.add_argument("--scene", type=int, default=1)
     args = parser.parse_args()
-    simple_train(scene_idx=args.scene, round_idx=args.round)
+    simple_train(round_idx=args.round, scene_idx=args.scene)
